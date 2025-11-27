@@ -5,6 +5,15 @@ import torch
 import triton
 import triton.language as tl
 
+from mamba_ssm.ops.kernel_config import use_cuda_kernel
+
+_use_cuda = use_cuda_kernel("swiglu")
+if _use_cuda:
+    try:
+        from mamba_ssm.ops.triton_static import swiglu_fwd_cuda, swiglu_bwd_cuda
+    except ImportError:
+        _use_cuda = False
+        swiglu_fwd_cuda = swiglu_bwd_cuda = None
 
 @triton.autotune(
     configs=[
@@ -47,6 +56,15 @@ def _swiglu_fwd(xy, out=None):
     batch_shape = xy.shape[:-1]
     xy = xy.reshape(-1, xy.shape[-1])
     x, y = xy.chunk(2, dim=-1)
+    
+    if _use_cuda and swiglu_fwd_cuda is not None:
+        if x.stride(-1) != 1:
+            x = x.contiguous()
+        if y.stride(-1) != 1:
+            y = y.contiguous()
+        out = swiglu_fwd_cuda(x, y)
+        return out.reshape(*batch_shape, out.shape[-1])
+    
     if out is None:
         out = torch.empty_like(x)
     else:
@@ -124,6 +142,20 @@ def _swiglu_bwd(xy, dout, dxy=None, recompute_output=False, out=None):
     x, y = xy.chunk(2, dim=-1)
     dout = dout.reshape(-1, dout.shape[-1])
     assert dout.shape == x.shape
+    
+    if _use_cuda and swiglu_bwd_cuda is not None:
+        if x.stride(-1) != 1:
+            x = x.contiguous()
+        if y.stride(-1) != 1:
+            y = y.contiguous()
+        results = swiglu_bwd_cuda(x, y, dout, recompute_output)
+        dx, dy = results[0], results[1]
+        dxy = torch.cat([dx, dy], dim=-1)
+        if not recompute_output:
+            return dxy.reshape(*batch_shape, dxy.shape[-1])
+        else:
+            return dxy.reshape(*batch_shape, dxy.shape[-1]), results[2].reshape(*batch_shape, results[2].shape[-1])
+    
     if dxy is None:
         dxy = torch.empty_like(xy)
     else:

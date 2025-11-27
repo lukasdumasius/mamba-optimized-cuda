@@ -1,0 +1,35 @@
+{
+  "selective_state_update": {
+    "use_cuda": false,
+    "description": "Selective state update kernel for Mamba"
+  },
+  "layer_norm": {
+    "use_cuda": false,
+    "description": "Fused layer normalization forward and backward"
+  },
+  "layernorm_gated": {
+    "use_cuda": false,
+    "description": "Gated RMS normalization for Mamba2"
+  },
+  "ssd_chunk_scan": {
+    "use_cuda": false,
+    "description": "Chunk scan kernel for SSD"
+  },
+  "ssd_chunk_state": {
+    "use_cuda": false,
+    "description": "Chunk state computation for SSD"
+  },
+  "ssd_bmm": {
+    "use_cuda": false,
+    "description": "Batch matrix multiplication for SSD"
+  },
+  "ssd_state_passing": {
+    "use_cuda": false,
+    "description": "State passing between chunks in SSD"
+  },
+  "swiglu": {
+    "use_cuda": true,
+    "description": "SwiGLU activation function"
+  }
+}
+

@@ -266,6 +266,25 @@ if not SKIP_CUDA_BUILD:
             include_dirs=[Path(this_dir) / "csrc" / "selective_scan"],
         )
     )
+    
+    kernels_config_path = Path(this_dir) / "kernels_config.json"
+    if kernels_config_path.exists():
+        with open(kernels_config_path) as f:
+            kernels_config = json.load(f)
+        
+        if any(k.get("use_cuda", False) for k in kernels_config.values()):
+            cuda_sources = ["mamba_ssm/ops/triton_static/bindings.cpp"]
+            if kernels_config.get("swiglu", {}).get("use_cuda", False):
+                cuda_sources.append("mamba_ssm/ops/triton_static/swiglu.cu")
+            
+            ext_modules.append(
+                CUDAExtension(
+                    name="mamba_ssm.ops.triton_static.cuda_kernels",
+                    sources=cuda_sources,
+                    extra_compile_args=extra_compile_args,
+                    include_dirs=[Path(this_dir) / "mamba_ssm" / "ops" / "triton_static"],
+                )
+            )
 
 
 def get_package_version():
