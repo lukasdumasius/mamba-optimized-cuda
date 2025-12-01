@@ -6,6 +6,7 @@
 #include <cassert>
 #include <tuple>
 #include <iostream>
+#include <type_traits>
 
 
 __host__ __device__ inline int div_up(int a, int b) { return (a + b - 1) / b; }
@@ -45,7 +46,8 @@ __global__ void chunk_scan_fwd_kernel(
     int64_t stride_C_batch, int64_t stride_C_seqlen, int64_t stride_C_group, int64_t stride_C_dstate,
     int64_t stride_states_batch, int64_t stride_states_chunk, int64_t stride_states_head, int64_t stride_states_hdim, int64_t stride_states_dstate,
     int64_t stride_out_batch, int64_t stride_out_seqlen, int64_t stride_out_head, int64_t stride_out_hdim,
-    bool HAS_Z, bool HAS_D, bool D_HAS_HDIM, bool HAS_SEQ_IDX, bool IS_CAUSAL
+    int64_t stride_z_hdim,
+    bool HAS_Z, bool HAS_D, bool D_HAS_HDIM, bool HAS_SEQ_IDX, bool IS_CAUSAL, bool USE_VEC2, bool USE_VEC2_Z, bool USE_VEC2_OUT
 ) {
 
     const int num_pid_n = div_up(headdim, BLOCK_N);
@@ -72,9 +74,13 @@ __global__ void chunk_scan_fwd_kernel(
     int m_len = min(BLOCK_M, chunk_size_limit - m_start);
     int n_len = min(BLOCK_N, headdim - n_start);
 
+    const int cols_per_thread = USE_VEC2 ? 2 : 1;
     int lane = threadIdx.x;
-    if (lane >= n_len) return;
-    int n_idx = n_start + lane;
+    int n_limit = n_start + n_len;
+    int n_idx0 = n_start + lane * cols_per_thread;
+    if (n_idx0 >= n_limit) return;
+    int n_idx1 = n_idx0 + 1;
+    bool has_col1 = USE_VEC2 && (n_idx1 < n_limit);
 
     const scalar_t* cb_base = cb + pid_b * stride_cb_batch + pid_c * stride_cb_chunk + group_idx * stride_cb_group;
     const scalar_t* x_base = x + pid_b * stride_x_batch + seq_start * stride_x_seqlen + pid_h * stride_x_head;
@@ -105,9 +111,11 @@ __global__ void chunk_scan_fwd_kernel(
     if (HAS_Z) out_x_base = out_x + pid_b * stride_out_batch + seq_start * stride_out_seqlen + pid_h * stride_out_head;
 
     // Each thread accumulates over its own head-dim column (n_idx)
-    acc_t acc[BLOCK_M];
+    acc_t acc_col0[BLOCK_M];
+    acc_t acc_col1[BLOCK_M];
     for (int i = 0; i < m_len; ++i) {
-        acc[i] = (acc_t)0;
+        acc_col0[i] = (acc_t)0;
+        if (has_col1) acc_col1[i] = (acc_t)0;
     }
 
     // Preload dA_cumsum for each output row m and (optionally) seq_idx for scale_m
@@ -146,29 +154,43 @@ __global__ void chunk_scan_fwd_kernel(
             }
         }
 
-        // Load prev_states tile for this thread's n_idx
-        acc_t P_tile_reg[BLOCK_D];
+        // Load prev_states tile for this thread's columns
+        acc_t P_tile_col0[BLOCK_D];
+        acc_t P_tile_col1[BLOCK_D];
         for (int kk = 0; kk < kd_len; ++kk) {
             int k_idx = kd + kk;
-            const scalar_t* pptr = states_base + n_idx * stride_states_hdim + k_idx * stride_states_dstate;
-            scalar_t pv = __ldg(pptr);
-            P_tile_reg[kk] = (acc_t)pv;
+            const scalar_t* pptr0 = states_base + n_idx0 * stride_states_hdim + k_idx * stride_states_dstate;
+            scalar_t pv0 = __ldg(pptr0);
+            P_tile_col0[kk] = (acc_t)pv0;
+            if (has_col1) {
+                const scalar_t* pptr1 = states_base + n_idx1 * stride_states_hdim + k_idx * stride_states_dstate;
+                scalar_t pv1 = __ldg(pptr1);
+                P_tile_col1[kk] = (acc_t)pv1;
+            }
         }
 
-        // Multiply: acc += C_tile_reg * P_tile_reg (per-thread column)
+        // Multiply: acc += C_tile_reg * P_tile for each column
         for (int i = 0; i < m_len; ++i) {
-            acc_t sum = acc[i];
+            acc_t sum0 = acc_col0[i];
             for (int kk = 0; kk < kd_len; ++kk) {
-                sum += C_tile_reg[i][kk] * P_tile_reg[kk];
+                sum0 += C_tile_reg[i][kk] * P_tile_col0[kk];
             }
-            acc[i] = sum;
+            acc_col0[i] = sum0;
+            if (has_col1) {
+                acc_t sum1 = acc_col1[i];
+                for (int kk = 0; kk < kd_len; ++kk) {
+                    sum1 += C_tile_reg[i][kk] * P_tile_col1[kk];
+                }
+                acc_col1[i] = sum1;
+            }
         }
     }
 
     // Apply scale from dA_cumsum per m to C @ prev_states term
     for (int i = 0; i < m_len; ++i) {
         acc_t s = scale_m_arr[i];
-        acc[i] *= s;
+        acc_col0[i] *= s;
+        if (has_col1) acc_col1[i] *= s;
     }
 
     // accumlate cb * x over k across chunk dimensions, including dA_cumsum factors and causal masking
@@ -178,7 +200,8 @@ __global__ void chunk_scan_fwd_kernel(
 
         // load cb_tile into shared memory or registers
         acc_t cb_tile_reg[BLOCK_M][BLOCK_K];
-        acc_t x_tile_reg[BLOCK_K];
+        acc_t x_tile_col0[BLOCK_K];
+        acc_t x_tile_col1[BLOCK_K];
 
         // preload dt_k and dA_k
         acc_t dt_vec[BLOCK_K];
@@ -210,21 +233,42 @@ __global__ void chunk_scan_fwd_kernel(
             }
         }
 
-        // Load x tile for this thread's n_idx
+        // Load x tile for this thread's columns
         for (int kk = 0; kk < klen; ++kk) {
             int k_idx = k0 + kk;
-            const scalar_t* xptr = x_base + k_idx * stride_x_seqlen + n_idx * stride_x_hdim;
-            scalar_t xv = __ldg(xptr);
-            x_tile_reg[kk] = (acc_t)xv;
+            const scalar_t* base_ptr = x_base + k_idx * stride_x_seqlen + n_idx0 * stride_x_hdim;
+            acc_t val0;
+            if (USE_VEC2 && has_col1 && stride_x_hdim == 1) {
+                const float2* xptr2 = reinterpret_cast<const float2*>(base_ptr);
+                float2 xv = __ldg(xptr2);
+                val0 = (acc_t)xv.x;
+                x_tile_col0[kk] = val0;
+                x_tile_col1[kk] = (acc_t)xv.y;
+                continue;
+            } else {
+                val0 = (acc_t)__ldg(base_ptr);
+                x_tile_col0[kk] = val0;
+                if (has_col1) {
+                    const scalar_t* base_ptr1 = x_base + k_idx * stride_x_seqlen + n_idx1 * stride_x_hdim;
+                    x_tile_col1[kk] = (acc_t)__ldg(base_ptr1);
+                }
+            }
         }
 
-        // acc += cb_tile_reg * x_tile_reg
+        // acc += cb_tile_reg * x_tile for each column
         for (int i = 0; i < m_len; ++i) {
-            acc_t sum = acc[i];
+            acc_t sum0 = acc_col0[i];
             for (int kk = 0; kk < klen; ++kk) {
-                sum += cb_tile_reg[i][kk] * x_tile_reg[kk];
+                sum0 += cb_tile_reg[i][kk] * x_tile_col0[kk];
             }
-            acc[i] = sum;
+            acc_col0[i] = sum0;
+            if (has_col1) {
+                acc_t sum1 = acc_col1[i];
+                for (int kk = 0; kk < klen; ++kk) {
+                    sum1 += cb_tile_reg[i][kk] * x_tile_col1[kk];
+                }
+                acc_col1[i] = sum1;
+            }
         }
     }
 
@@ -232,29 +276,80 @@ __global__ void chunk_scan_fwd_kernel(
     if (HAS_D) {
         for (int i = 0; i < m_len; ++i) {
             int m_idx = m_start + i;
-            acc_t x_res = (acc_t) __ldg(x_base + m_idx * stride_x_seqlen + n_idx * stride_x_hdim);
-            acc_t Dv;
+            const scalar_t* xptr0 = x_base + m_idx * stride_x_seqlen + n_idx0 * stride_x_hdim;
+            acc_t x_res0 = (acc_t) __ldg(xptr0);
+            acc_t Dv0;
             if (D_HAS_HDIM) {
-                Dv = (acc_t) __ldg(D + pid_h * headdim + n_idx);
+                Dv0 = (acc_t) __ldg(D + pid_h * headdim + n_idx0);
             } else {
-                Dv = (acc_t) __ldg(D + pid_h);
+                Dv0 = (acc_t) __ldg(D + pid_h);
             }
-            acc[i] += x_res * Dv;
+            acc_col0[i] += x_res0 * Dv0;
+            if (has_col1) {
+                const scalar_t* xptr1 = x_base + m_idx * stride_x_seqlen + n_idx1 * stride_x_hdim;
+                acc_t x_res1 = (acc_t) __ldg(xptr1);
+                acc_t Dv1 = D_HAS_HDIM ? (acc_t)__ldg(D + pid_h * headdim + n_idx1)
+                                       : (acc_t)__ldg(D + pid_h);
+                acc_col1[i] += x_res1 * Dv1;
+            }
         }
     }
 
     // HAS_Z from Triton kernel
     for (int i = 0; i < m_len; ++i) {
         int m_idx = m_start + i;
-        acc_t val = acc[i];
+        acc_t val0 = acc_col0[i];
+        acc_t val1 = has_col1 ? acc_col1[i] : (acc_t)0;
+        
+        // Process z gating for column 0
         if (HAS_Z) {
-            out_x_base[m_idx * stride_out_seqlen + n_idx * stride_out_hdim] = (scalar_t) val;
-            scalar_t zval = __ldg(z_base + m_idx * stride_x_seqlen + n_idx * stride_x_hdim);
-            float zf = (float)zval;
-            float gated = zf * (1.0f / (1.0f + expf(-zf)));
-            val = val * (acc_t)gated;
+            out_x_base[m_idx * stride_out_seqlen + n_idx0 * stride_out_hdim] = (scalar_t) val0;
+            scalar_t zval0;
+            if (USE_VEC2_Z && has_col1) {
+                const float2* zptr2 = reinterpret_cast<const float2*>(z_base + m_idx * stride_x_seqlen + n_idx0 * stride_z_hdim);
+                float2 zv = __ldg(zptr2);
+                zval0 = (scalar_t)zv.x;
+                float zf0 = (float)zval0;
+                float gated0 = zf0 * (1.0f / (1.0f + expf(-zf0)));
+                val0 = val0 * (acc_t)gated0;
+                
+                // Process column 1 z gating
+                if (has_col1) {
+                    out_x_base[m_idx * stride_out_seqlen + n_idx1 * stride_out_hdim] = (scalar_t) val1;
+                    scalar_t zval1 = (scalar_t)zv.y;
+                    float zf1 = (float)zval1;
+                    float gated1 = zf1 * (1.0f / (1.0f + expf(-zf1)));
+                    val1 = val1 * (acc_t)gated1;
+                }
+            } else {
+                zval0 = __ldg(z_base + m_idx * stride_x_seqlen + n_idx0 * stride_z_hdim);
+                float zf0 = (float)zval0;
+                float gated0 = zf0 * (1.0f / (1.0f + expf(-zf0)));
+                val0 = val0 * (acc_t)gated0;
+                
+                if (has_col1) {
+                    out_x_base[m_idx * stride_out_seqlen + n_idx1 * stride_out_hdim] = (scalar_t) val1;
+                    scalar_t zval1 = __ldg(z_base + m_idx * stride_x_seqlen + n_idx1 * stride_z_hdim);
+                    float zf1 = (float)zval1;
+                    float gated1 = zf1 * (1.0f / (1.0f + expf(-zf1)));
+                    val1 = val1 * (acc_t)gated1;
+                }
+            }
         }
-        out_base[m_idx * stride_out_seqlen + n_idx * stride_out_hdim] = (scalar_t) val;
+        
+        // Write outputs with vectorization if possible
+        if (USE_VEC2_OUT && has_col1) {
+            float2* outptr2 = reinterpret_cast<float2*>(out_base + m_idx * stride_out_seqlen + n_idx0 * stride_out_hdim);
+            float2 outv;
+            outv.x = (float)val0;
+            outv.y = (float)val1;
+            *outptr2 = outv;
+        } else {
+            out_base[m_idx * stride_out_seqlen + n_idx0 * stride_out_hdim] = (scalar_t) val0;
+            if (has_col1) {
+                out_base[m_idx * stride_out_seqlen + n_idx1 * stride_out_hdim] = (scalar_t) val1;
+            }
+        }
     }
 }
 
@@ -343,8 +438,6 @@ std::vector<torch::Tensor> chunk_scan_fwd_cuda(
     int grid_z = nheads;
 
     dim3 grid(grid_x, grid_y, grid_z);
-    // One thread per head-dim column within the BLOCK_N tile
-    dim3 block(BLOCK_N);
 
     // IS_CAUSAL is always true in current usage (`chunk_scan` is causal)
     bool IS_CAUSAL = true;
@@ -366,7 +459,17 @@ std::vector<torch::Tensor> chunk_scan_fwd_cuda(
 
         size_t shmem_bytes = 0;
 
-        chunk_scan_fwd_kernel<scalar_t, acc_t><<<grid, 1, shmem_bytes, at::cuda::getCurrentCUDAStream()>>>(
+        constexpr bool kIsFloat = std::is_same<scalar_t, float>::value;
+        // Always enable vectorization for fp32 (handle odd headdim with special case)
+        bool use_vec2 = kIsFloat && (stride_x_hdim == 1);
+        // Check if z and out can be vectorized (stride must be 1)
+        int64_t stride_z_hdim = HAS_Z ? z.strides()[3] : 0;
+        bool use_vec2_z = kIsFloat && HAS_Z && (stride_z_hdim == 1);
+        bool use_vec2_out = kIsFloat && (stride_out_hdim == 1);
+        int threads_x = use_vec2 ? (BLOCK_N / 2) : BLOCK_N;
+        dim3 block(threads_x);
+
+        chunk_scan_fwd_kernel<scalar_t, acc_t><<<grid, block, shmem_bytes, at::cuda::getCurrentCUDAStream()>>>(
             cb_ptr, x_ptr, z_ptr, dt_ptr, dA_ptr, seq_ptr, C_ptr, states_ptr, D_ptr,
             out_ptr, out_x_ptr,
             batch, seqlen, nheads, headdim,
@@ -378,7 +481,8 @@ std::vector<torch::Tensor> chunk_scan_fwd_cuda(
             stride_C_batch, stride_C_seqlen, stride_C_group, stride_C_dstate,
             stride_states_batch, stride_states_chunk, stride_states_head, stride_states_hdim, stride_states_dstate,
             stride_out_batch, stride_out_seqlen, stride_out_head, stride_out_hdim,
-            HAS_Z, HAS_D, D.defined() && D.dim() == 2, HAS_SEQ_IDX, IS_CAUSAL
+            stride_z_hdim,
+            HAS_Z, HAS_D, D.defined() && D.dim() == 2, HAS_SEQ_IDX, IS_CAUSAL, use_vec2, use_vec2_z, use_vec2_out
         );
         cudaError_t err = cudaGetLastError();
         if (err != cudaSuccess) {
