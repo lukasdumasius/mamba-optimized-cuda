@@ -45,7 +45,7 @@ __global__ void chunk_scan_fwd_kernel(
     int64_t stride_C_batch, int64_t stride_C_seqlen, int64_t stride_C_group, int64_t stride_C_dstate,
     int64_t stride_states_batch, int64_t stride_states_chunk, int64_t stride_states_head, int64_t stride_states_hdim, int64_t stride_states_dstate,
     int64_t stride_out_batch, int64_t stride_out_seqlen, int64_t stride_out_head, int64_t stride_out_hdim,
-    bool HAS_Z, bool HAS_D, bool D_HAS_HDIM, bool HAS_SEQ_IDX
+    bool HAS_Z, bool HAS_D, bool D_HAS_HDIM, bool HAS_SEQ_IDX, bool IS_CAUSAL
 ) {
 
     const int num_pid_n = div_up(headdim, BLOCK_N);
@@ -67,13 +67,14 @@ __global__ void chunk_scan_fwd_kernel(
 
     int m_start = pid_m * BLOCK_M;
     int n_start = pid_n * BLOCK_N;
-    int m_len = min(BLOCK_M, chunk_size - m_start);
+    int seq_start = pid_c * chunk_size;
+    int chunk_size_limit = min(chunk_size, max(0, seqlen - seq_start));
+    int m_len = min(BLOCK_M, chunk_size_limit - m_start);
     int n_len = min(BLOCK_N, headdim - n_start);
 
     if (m_len <= 0 || n_len <= 0) return;
 
     const scalar_t* cb_base = cb + pid_b * stride_cb_batch + pid_c * stride_cb_chunk + group_idx * stride_cb_group;
-    int seq_start = pid_c * chunk_size;
     const scalar_t* x_base = x + pid_b * stride_x_batch + seq_start * stride_x_seqlen + pid_h * stride_x_head;
     const scalar_t* dt_base = dt + pid_b * stride_dt_batch + pid_h * stride_dt_head + pid_c * stride_dt_chunk;
     const scalar_t* dA_base = dA_cumsum + pid_b * stride_dA_batch + pid_h * stride_dA_head + pid_c * stride_dA_chunk;
@@ -85,8 +86,16 @@ __global__ void chunk_scan_fwd_kernel(
         z_base = z + pid_b * stride_x_batch + seq_start * stride_x_seqlen + pid_h * stride_x_head;
     }
     const int64_t* seq_idx_base = nullptr;
+    int64_t seq_idx_prev = 0;
     if (HAS_SEQ_IDX) {
+        // seq_idx: (batch, seqlen), assume standard contiguous layout
         seq_idx_base = seq_idx + pid_b * seqlen;
+        if (pid_c >= 1) {
+            int prev_pos = pid_c * chunk_size - 1;
+            if (prev_pos >= 0 && prev_pos < seqlen) {
+                seq_idx_prev = seq_idx_base[prev_pos];
+            }
+        }
     }
 
     scalar_t* out_base = out + pid_b * stride_out_batch + seq_start * stride_out_seqlen + pid_h * stride_out_head;
@@ -98,7 +107,26 @@ __global__ void chunk_scan_fwd_kernel(
         for (int j = 0; j < n_len; ++j) acc[i][j] = (acc_t)0;
     }
 
-    // compute contribution from C @ prev_states
+    // Preload dA_cumsum for each output row m and (optionally) seq_idx for scale_m
+    acc_t dA_m_arr[BLOCK_M];
+    acc_t scale_m_arr[BLOCK_M];
+    for (int i = 0; i < m_len; ++i) {
+        int m_idx = m_start + i;
+        const scalar_t* dAptr = dA_base + m_idx * stride_dA_csize;
+        acc_t dA_val = (acc_t)__ldg(dAptr);
+        dA_m_arr[i] = dA_val;
+        acc_t scale = 0;
+        if (!HAS_SEQ_IDX) {
+            scale = (acc_t)expf((float)dA_val);
+        } else {
+            int seq_pos = seq_start + m_idx;
+            int64_t seq_m = (seq_pos >= 0 && seq_pos < seqlen) ? seq_idx_base[seq_pos] : (int64_t)-1;
+            scale = (seq_m == seq_idx_prev) ? (acc_t)expf((float)dA_val) : (acc_t)0;
+        }
+        scale_m_arr[i] = scale;
+    }
+
+    // compute contribution from C @ prev_states, then apply scale_m per row
     for (int kd = 0; kd < dstate; kd += BLOCK_D) {
         int kd_len = min(BLOCK_D, dstate - kd);
 
@@ -139,46 +167,48 @@ __global__ void chunk_scan_fwd_kernel(
         }
     }
 
-    // Apply scale from dA_cumsum per m
-    acc_t scale_m_arr[BLOCK_M];
-    for (int i = 0; i < m_len; ++i) {
-        int m_idx = m_start + i;
-        const scalar_t* dAptr = dA_base + m_idx * stride_dA_csize;
-        acc_t dA = (acc_t) __ldg(dAptr);
-        scale_m_arr[i] = expf((float)dA);
-    }
+    // Apply scale from dA_cumsum per m to C @ prev_states term
     for (int i = 0; i < m_len; ++i) {
         acc_t s = scale_m_arr[i];
         for (int j = 0; j < n_len; ++j) acc[i][j] *= s;
     }
 
-    // accumlate cb * x over k across chunk dimensions
-    for (int k0 = 0; k0 < chunk_size; k0 += BLOCK_K) {
-        int klen = min(BLOCK_K, chunk_size - k0);
+    // accumlate cb * x over k across chunk dimensions, including dA_cumsum factors and causal masking
+    int K_MAX = IS_CAUSAL ? min((pid_m + 1) * BLOCK_M, chunk_size_limit) : chunk_size_limit;
+    for (int k0 = 0; k0 < K_MAX; k0 += BLOCK_K) {
+        int klen = min(BLOCK_K, K_MAX - k0);
 
         // load cb_tile into shared memory or registers
         acc_t cb_tile_reg[BLOCK_M][BLOCK_K];
         acc_t x_tile_reg[BLOCK_K][BLOCK_N];
 
-        // preload dt_k and compute combined cb *= dt_k
+        // preload dt_k and dA_k
         acc_t dt_vec[BLOCK_K];
+        acc_t dA_k_vec[BLOCK_K];
         for (int kk = 0; kk < klen; ++kk) {
             int k_idx = k0 + kk;
             const scalar_t* dtptr = dt_base + k_idx * stride_dt_csize;
             dt_vec[kk] = (acc_t)__ldg(dtptr);
+            const scalar_t* dAkptr = dA_base + k_idx * stride_dA_csize;
+            dA_k_vec[kk] = (acc_t)__ldg(dAkptr);
         }
 
         for (int i = 0; i < m_len; ++i) {
             int m_idx = m_start + i;
             for (int kk = 0; kk < klen; ++kk) {
                 int k_idx = k0 + kk;
-                // compute mask for causal: require m_idx >= k_idx (within chunk offset)
-                bool pass = (m_idx >= k_idx); 
+                // compute mask for causal: require m_idx >= k_idx (within chunk offset) if IS_CAUSAL
+                bool pass = (!IS_CAUSAL) || (m_idx >= k_idx); 
                 if (!pass) { cb_tile_reg[i][kk] = (acc_t)0; continue; }
                 const scalar_t* cbptr = cb_base + m_idx * stride_cb_m + k_idx * stride_cb_k;
                 scalar_t v = __ldg(cbptr);
-                // multiply by dt scalar
-                cb_tile_reg[i][kk] = (acc_t)v * dt_vec[kk];
+                // multiply by exp(min(dA_m - dA_k, 0)) and dt scalar
+                float dA_m = (float)dA_m_arr[i];
+                float dA_k = (float)dA_k_vec[kk];
+                float diff = dA_m - dA_k;
+                if (diff > 0.0f) diff = 0.0f;
+                float scale = expf(diff);
+                cb_tile_reg[i][kk] = (acc_t)v * dt_vec[kk] * (acc_t)scale;
             }
         }
 
@@ -240,14 +270,22 @@ __global__ void chunk_scan_fwd_kernel(
     }
 }
 
-// Host wrapper
-std::vector<torch::Tensor> chunk_scan_fwd_cuda_launcher(
-    torch::Tensor cb, torch::Tensor x, torch::Tensor z,
-    torch::Tensor dt, torch::Tensor dA_cumsum,
-    torch::Tensor seq_idx,
-    torch::Tensor C, torch::Tensor states, torch::Tensor D,
-    bool IS_CAUSAL
+// Host wrapper used by Python binding `chunk_scan_fwd_cuda`
+std::vector<torch::Tensor> chunk_scan_fwd_cuda(
+    torch::Tensor cb,
+    torch::Tensor x,
+    torch::Tensor dt,
+    torch::Tensor dA_cumsum,
+    torch::Tensor C,
+    torch::Tensor states,
+    c10::optional<torch::Tensor> D_opt,
+    c10::optional<torch::Tensor> z_opt,
+    c10::optional<torch::Tensor> seq_idx_opt
 ) {
+    // Unpack optionals
+    torch::Tensor D = D_opt.has_value() ? *D_opt : torch::Tensor();
+    torch::Tensor z = z_opt.has_value() ? *z_opt : torch::Tensor();
+    torch::Tensor seq_idx = seq_idx_opt.has_value() ? *seq_idx_opt : torch::Tensor();
     bool HAS_Z = z.defined();
     bool HAS_D = D.defined();
     bool HAS_SEQ_IDX = seq_idx.defined();
@@ -319,6 +357,9 @@ std::vector<torch::Tensor> chunk_scan_fwd_cuda_launcher(
     dim3 grid(grid_x, grid_y, grid_z);
     dim3 block(1); // TODO: we are not using threads inside block (we unrolled everything). Could be optimized to use thread parallelism...
 
+    // IS_CAUSAL is always true in current usage (`chunk_scan` is causal)
+    bool IS_CAUSAL = true;
+
     AT_DISPATCH_FLOATING_TYPES_AND_HALF(x.scalar_type(), "chunk_scan_fwd_cuda", ([&] {
         using scalar_t = scalar_t;
         using acc_t = float;
@@ -348,7 +389,7 @@ std::vector<torch::Tensor> chunk_scan_fwd_cuda_launcher(
             stride_C_batch, stride_C_seqlen, stride_C_group, stride_C_dstate,
             stride_states_batch, stride_states_chunk, stride_states_head, stride_states_hdim, stride_states_dstate,
             stride_out_batch, stride_out_seqlen, stride_out_head, stride_out_hdim,
-            HAS_Z, HAS_D, D.defined() && D.dim() == 2, HAS_SEQ_IDX
+            HAS_Z, HAS_D, D.defined() && D.dim() == 2, HAS_SEQ_IDX, IS_CAUSAL
         );
         cudaError_t err = cudaGetLastError();
         if (err != cudaSuccess) {
