@@ -277,6 +277,8 @@ if not SKIP_CUDA_BUILD:
             cuda_sources = ["mamba_ssm/ops/triton_static/bindings.cpp"]
             if kernels_config.get("swiglu", {}).get("use_cuda", False):
                 cuda_sources.append("mamba_ssm/ops/triton_static/swiglu.cu")
+            if kernels_config.get("ssd_chunk_scan", {}).get("use_cuda", False):
+                cuda_sources.append("mamba_ssm/ops/triton_static/chunk_scan_fwd.cu")
             
             ext_modules.append(
                 CUDAExtension(

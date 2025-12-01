@@ -12,7 +12,7 @@
     "description": "Gated RMS normalization for Mamba2"
   },
   "ssd_chunk_scan": {
-    "use_cuda": false,
+    "use_cuda": true,
     "description": "Chunk scan kernel for SSD"
   },
   "ssd_chunk_state": {

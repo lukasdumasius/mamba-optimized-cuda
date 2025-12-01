@@ -15,8 +15,18 @@ import triton.language as tl
 from einops import rearrange, repeat
 
 from mamba_ssm.ops.triton.ssd_bmm import _bmm_chunk_fwd, _bmm_chunk_bwd
+from mamba_ssm.ops.kernel_config import use_cuda_kernel
 
 TRITON_22 = version.parse(triton.__version__) >= version.parse('2.2.0')
+
+# Check if CUDA kernel should be used for ssd_chunk_scan
+_use_cuda_chunk_scan = use_cuda_kernel("ssd_chunk_scan")
+if _use_cuda_chunk_scan:
+    try:
+        from mamba_ssm.ops.triton_static import chunk_scan_fwd_cuda
+    except ImportError:
+        _use_cuda_chunk_scan = False
+        chunk_scan_fwd_cuda = None
 
 
 def init_to_zero(names):
@@ -1248,6 +1258,15 @@ def _chunk_scan_fwd(cb, x, dt, dA_cumsum, C, states, D=None, z=None, seq_idx=Non
     assert states.shape == (batch, nchunks, nheads, headdim, dstate)
     if seq_idx is not None:
         assert seq_idx.shape == (batch, seqlen)
+    
+    # Use CUDA kernel if available and configured
+    if _use_cuda_chunk_scan and chunk_scan_fwd_cuda is not None:
+        results = chunk_scan_fwd_cuda(cb, x, dt, dA_cumsum, C, states, D, z, seq_idx)
+        if z is not None:
+            return results[0], results[1]
+        else:
+            return results[0], None
+    
     # Allocates output.
     out = torch.empty(batch, seqlen, nheads, headdim, device=x.device, dtype=x.dtype)
     if z is not None:
