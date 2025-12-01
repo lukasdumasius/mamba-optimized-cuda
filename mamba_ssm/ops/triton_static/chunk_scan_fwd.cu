@@ -72,7 +72,9 @@ __global__ void chunk_scan_fwd_kernel(
     int m_len = min(BLOCK_M, chunk_size_limit - m_start);
     int n_len = min(BLOCK_N, headdim - n_start);
 
-    if (m_len <= 0 || n_len <= 0) return;
+    int lane = threadIdx.x;
+    if (lane >= n_len) return;
+    int n_idx = n_start + lane;
 
     const scalar_t* cb_base = cb + pid_b * stride_cb_batch + pid_c * stride_cb_chunk + group_idx * stride_cb_group;
     const scalar_t* x_base = x + pid_b * stride_x_batch + seq_start * stride_x_seqlen + pid_h * stride_x_head;
@@ -102,9 +104,10 @@ __global__ void chunk_scan_fwd_kernel(
     scalar_t* out_x_base = nullptr;
     if (HAS_Z) out_x_base = out_x + pid_b * stride_out_batch + seq_start * stride_out_seqlen + pid_h * stride_out_head;
 
-    acc_t acc[BLOCK_M][BLOCK_N/1];
+    // Each thread accumulates over its own head-dim column (n_idx)
+    acc_t acc[BLOCK_M];
     for (int i = 0; i < m_len; ++i) {
-        for (int j = 0; j < n_len; ++j) acc[i][j] = (acc_t)0;
+        acc[i] = (acc_t)0;
     }
 
     // Preload dA_cumsum for each output row m and (optionally) seq_idx for scale_m
@@ -143,34 +146,29 @@ __global__ void chunk_scan_fwd_kernel(
             }
         }
 
-        // Load prev_states tile
-        acc_t P_tile_reg[BLOCK_D][BLOCK_N];
+        // Load prev_states tile for this thread's n_idx
+        acc_t P_tile_reg[BLOCK_D];
         for (int kk = 0; kk < kd_len; ++kk) {
             int k_idx = kd + kk;
-            for (int j = 0; j < n_len; ++j) {
-                int n_idx = n_start + j;
-                // prev_states element at (n_idx, k_idx):
-                const scalar_t* pptr = states_base + n_idx * stride_states_hdim + k_idx * stride_states_dstate;
-                scalar_t pv = __ldg(pptr);
-                P_tile_reg[kk][j] = (acc_t)pv;
-            }
+            const scalar_t* pptr = states_base + n_idx * stride_states_hdim + k_idx * stride_states_dstate;
+            scalar_t pv = __ldg(pptr);
+            P_tile_reg[kk] = (acc_t)pv;
         }
 
-        // Multiply: acc += C_tile_reg * P_tile_reg
+        // Multiply: acc += C_tile_reg * P_tile_reg (per-thread column)
         for (int i = 0; i < m_len; ++i) {
+            acc_t sum = acc[i];
             for (int kk = 0; kk < kd_len; ++kk) {
-                acc_t a = C_tile_reg[i][kk];
-                for (int j = 0; j < n_len; ++j) {
-                    acc[i][j] += a * P_tile_reg[kk][j];
-                }
+                sum += C_tile_reg[i][kk] * P_tile_reg[kk];
             }
+            acc[i] = sum;
         }
     }
 
     // Apply scale from dA_cumsum per m to C @ prev_states term
     for (int i = 0; i < m_len; ++i) {
         acc_t s = scale_m_arr[i];
-        for (int j = 0; j < n_len; ++j) acc[i][j] *= s;
+        acc[i] *= s;
     }
 
     // accumlate cb * x over k across chunk dimensions, including dA_cumsum factors and causal masking
@@ -180,7 +178,7 @@ __global__ void chunk_scan_fwd_kernel(
 
         // load cb_tile into shared memory or registers
         acc_t cb_tile_reg[BLOCK_M][BLOCK_K];
-        acc_t x_tile_reg[BLOCK_K][BLOCK_N];
+        acc_t x_tile_reg[BLOCK_K];
 
         // preload dt_k and dA_k
         acc_t dt_vec[BLOCK_K];
@@ -212,25 +210,21 @@ __global__ void chunk_scan_fwd_kernel(
             }
         }
 
-        // Load x tile
+        // Load x tile for this thread's n_idx
         for (int kk = 0; kk < klen; ++kk) {
             int k_idx = k0 + kk;
-            for (int j = 0; j < n_len; ++j) {
-                int n_idx = n_start + j;
-                const scalar_t* xptr = x_base + k_idx * stride_x_seqlen + n_idx * stride_x_hdim;
-                scalar_t xv = __ldg(xptr);
-                x_tile_reg[kk][j] = (acc_t)xv;
-            }
+            const scalar_t* xptr = x_base + k_idx * stride_x_seqlen + n_idx * stride_x_hdim;
+            scalar_t xv = __ldg(xptr);
+            x_tile_reg[kk] = (acc_t)xv;
         }
 
         // acc += cb_tile_reg * x_tile_reg
         for (int i = 0; i < m_len; ++i) {
+            acc_t sum = acc[i];
             for (int kk = 0; kk < klen; ++kk) {
-                acc_t a = cb_tile_reg[i][kk];
-                for (int j = 0; j < n_len; ++j) {
-                    acc[i][j] += a * x_tile_reg[kk][j];
-                }
+                sum += cb_tile_reg[i][kk] * x_tile_reg[kk];
             }
+            acc[i] = sum;
         }
     }
 
@@ -238,35 +232,29 @@ __global__ void chunk_scan_fwd_kernel(
     if (HAS_D) {
         for (int i = 0; i < m_len; ++i) {
             int m_idx = m_start + i;
-            for (int j = 0; j < n_len; ++j) {
-                int n_idx = n_start + j;
-                acc_t x_res = (acc_t) __ldg(x_base + m_idx * stride_x_seqlen + n_idx * stride_x_hdim);
-                acc_t Dv;
-                if (D_HAS_HDIM) {
-                    Dv = (acc_t) __ldg(D + pid_h * headdim + n_idx);
-                } else {
-                    Dv = (acc_t) __ldg(D + pid_h);
-                }
-                acc[i][j] += x_res * Dv;
+            acc_t x_res = (acc_t) __ldg(x_base + m_idx * stride_x_seqlen + n_idx * stride_x_hdim);
+            acc_t Dv;
+            if (D_HAS_HDIM) {
+                Dv = (acc_t) __ldg(D + pid_h * headdim + n_idx);
+            } else {
+                Dv = (acc_t) __ldg(D + pid_h);
             }
+            acc[i] += x_res * Dv;
         }
     }
 
     // HAS_Z from Triton kernel
     for (int i = 0; i < m_len; ++i) {
         int m_idx = m_start + i;
-        for (int j = 0; j < n_len; ++j) {
-            int n_idx = n_start + j;
-            acc_t val = acc[i][j];
-            if (HAS_Z) {
-                out_x_base[m_idx * stride_out_seqlen + n_idx * stride_out_hdim] = (scalar_t) val;
-                scalar_t zval = __ldg(z_base + m_idx * stride_x_seqlen + n_idx * stride_x_hdim);
-                float zf = (float)zval;
-                float gated = zf * (1.0f / (1.0f + expf(-zf)));
-                val = val * (acc_t)gated;
-            }
-            out_base[m_idx * stride_out_seqlen + n_idx * stride_out_hdim] = (scalar_t) val;
+        acc_t val = acc[i];
+        if (HAS_Z) {
+            out_x_base[m_idx * stride_out_seqlen + n_idx * stride_out_hdim] = (scalar_t) val;
+            scalar_t zval = __ldg(z_base + m_idx * stride_x_seqlen + n_idx * stride_x_hdim);
+            float zf = (float)zval;
+            float gated = zf * (1.0f / (1.0f + expf(-zf)));
+            val = val * (acc_t)gated;
         }
+        out_base[m_idx * stride_out_seqlen + n_idx * stride_out_hdim] = (scalar_t) val;
     }
 }
 
@@ -355,7 +343,8 @@ std::vector<torch::Tensor> chunk_scan_fwd_cuda(
     int grid_z = nheads;
 
     dim3 grid(grid_x, grid_y, grid_z);
-    dim3 block(1); // TODO: we are not using threads inside block (we unrolled everything). Could be optimized to use thread parallelism...
+    // One thread per head-dim column within the BLOCK_N tile
+    dim3 block(BLOCK_N);
 
     // IS_CAUSAL is always true in current usage (`chunk_scan` is causal)
     bool IS_CAUSAL = true;
