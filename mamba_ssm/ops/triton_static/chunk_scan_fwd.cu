@@ -165,6 +165,7 @@ __global__ void chunk_scan_fwd_kernel(
         for (int kk = 0; kk < klen; ++kk) {
             int k_idx = k0 + kk;
             const scalar_t* dtptr = dt_base + k_idx * stride_dt_csize;
+            dt_vec[kk] = (acc_t)__ldg(dtptr);
         }
 
         for (int i = 0; i < m_len; ++i) {
