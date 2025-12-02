@@ -25,6 +25,9 @@ from torch.utils.cpp_extension import (
     HIP_HOME
 )
 
+# Limit parallel CUDA compilations to prevent RAM exhaustion during build.
+if "MAX_JOBS" not in os.environ:
+    os.environ["MAX_JOBS"] = "4"
 
 with open("README.md", "r", encoding="utf-8") as fh:
     long_description = fh.read()
