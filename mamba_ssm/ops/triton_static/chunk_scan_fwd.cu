@@ -30,7 +30,7 @@ __global__ void chunk_scan_fwd_kernel(
     const scalar_t* __restrict__ x,             // x: (batch, seqlen, nheads, headdim)
     const scalar_t* __restrict__ z,             // optional z same shape as x
     const scalar_t* __restrict__ dt,            // dt: (batch, nheads, nchunks, chunk_size)
-    const scalar_t* __restrict__ dA_cumsum,     // dA_cumsum: (batch, nheads, nchunks, chunk_size)
+    const float* __restrict__ dA_cumsum,        // dA_cumsum: (batch, nheads, nchunks, chunk_size) - ALWAYS float32
     const int64_t* __restrict__ seq_idx,        // optional seq_idx: (batch, seqlen) or nullptr
     const scalar_t* __restrict__ C,             // C: (batch, seqlen, ngroups, dstate)
     const scalar_t* __restrict__ states,        // states: (batch, nchunks, nheads, headdim, dstate)
@@ -85,7 +85,7 @@ __global__ void chunk_scan_fwd_kernel(
     const scalar_t* cb_base = cb + pid_b * stride_cb_batch + pid_c * stride_cb_chunk + group_idx * stride_cb_group;
     const scalar_t* x_base = x + pid_b * stride_x_batch + seq_start * stride_x_seqlen + pid_h * stride_x_head;
     const scalar_t* dt_base = dt + pid_b * stride_dt_batch + pid_h * stride_dt_head + pid_c * stride_dt_chunk;
-    const scalar_t* dA_base = dA_cumsum + pid_b * stride_dA_batch + pid_h * stride_dA_head + pid_c * stride_dA_chunk;
+    const float* dA_base = dA_cumsum + pid_b * stride_dA_batch + pid_h * stride_dA_head + pid_c * stride_dA_chunk;
     const scalar_t* C_base = C + pid_b * stride_C_batch + (seq_start) * stride_C_seqlen + group_idx * stride_C_group;
     const scalar_t* states_base = states + pid_b * stride_states_batch + pid_c * stride_states_chunk + pid_h * stride_states_head;
 
@@ -123,7 +123,7 @@ __global__ void chunk_scan_fwd_kernel(
     acc_t scale_m_arr[BLOCK_M];
     for (int i = 0; i < m_len; ++i) {
         int m_idx = m_start + i;
-        const scalar_t* dAptr = dA_base + m_idx * stride_dA_csize;
+        const float* dAptr = dA_base + m_idx * stride_dA_csize;
         acc_t dA_val = (acc_t)__ldg(dAptr);
         dA_m_arr[i] = dA_val;
         acc_t scale = 0;
@@ -210,7 +210,7 @@ __global__ void chunk_scan_fwd_kernel(
             int k_idx = k0 + kk;
             const scalar_t* dtptr = dt_base + k_idx * stride_dt_csize;
             dt_vec[kk] = (acc_t)__ldg(dtptr);
-            const scalar_t* dAkptr = dA_base + k_idx * stride_dA_csize;
+            const float* dAkptr = dA_base + k_idx * stride_dA_csize;
             dA_k_vec[kk] = (acc_t)__ldg(dAkptr);
         }
 
@@ -449,7 +449,7 @@ std::vector<torch::Tensor> chunk_scan_fwd_cuda(
         const scalar_t* x_ptr = x.data_ptr<scalar_t>();
         const scalar_t* z_ptr = HAS_Z ? z.data_ptr<scalar_t>() : nullptr;
         const scalar_t* dt_ptr = dt.data_ptr<scalar_t>();
-        const scalar_t* dA_ptr = dA_cumsum.data_ptr<scalar_t>();
+        const float* dA_ptr = dA_cumsum.data_ptr<float>();
         const int64_t* seq_ptr = HAS_SEQ_IDX ? seq_idx.data_ptr<int64_t>() : nullptr;
         const scalar_t* C_ptr = C.data_ptr<scalar_t>();
         const scalar_t* states_ptr = states.data_ptr<scalar_t>();
