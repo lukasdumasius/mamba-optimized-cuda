@@ -8,6 +8,10 @@
 #include <iostream>
 #include <type_traits>
 
+#include <mma.h>
+#include <cuda_pipeline.h>
+
+using namespace nvcuda;
 
 __host__ __device__ inline int div_up(int a, int b) { return (a + b - 1) / b; }
 
@@ -23,6 +27,10 @@ __host__ __device__ inline int div_up(int a, int b) { return (a + b - 1) / b; }
 #ifndef BLOCK_D
 #define BLOCK_D 64 // tile for dstate gemm
 #endif
+
+#define WMMA_M 16
+#define WMMA_N 16
+#define WMMA_K 16
 
 template<typename scalar_t, typename acc_t>
 __global__ void chunk_scan_fwd_kernel(
@@ -78,9 +86,9 @@ __global__ void chunk_scan_fwd_kernel(
     int lane = threadIdx.x;
     int n_limit = n_start + n_len;
     int n_idx0 = n_start + lane * cols_per_thread;
-    if (n_idx0 >= n_limit) return;
-    int n_idx1 = n_idx0 + 1;
-    bool has_col1 = USE_VEC2 && (n_idx1 < n_limit);
+    
+    int n_idx1 = n_idx0 + 1; 
+    bool has_col1 = (cols_per_thread == 2) && (n_idx1 < n_limit);
 
     const scalar_t* cb_base = cb + pid_b * stride_cb_batch + pid_c * stride_cb_chunk + group_idx * stride_cb_group;
     const scalar_t* x_base = x + pid_b * stride_x_batch + seq_start * stride_x_seqlen + pid_h * stride_x_head;
@@ -100,8 +108,9 @@ __global__ void chunk_scan_fwd_kernel(
         seq_idx_base = seq_idx + pid_b * seqlen;
         if (pid_c >= 1) {
             int prev_pos = pid_c * chunk_size - 1;
-            if (prev_pos >= 0 && prev_pos < seqlen) {
-                seq_idx_prev = seq_idx_base[prev_pos];
+            int prev_pos_actual = min(prev_pos, seqlen - 1);
+            if (prev_pos_actual >= 0) {
+                seq_idx_prev = seq_idx_base[prev_pos_actual];
             }
         }
     }
@@ -121,156 +130,204 @@ __global__ void chunk_scan_fwd_kernel(
     // Preload dA_cumsum for each output row m and (optionally) seq_idx for scale_m
     acc_t dA_m_arr[BLOCK_M];
     acc_t scale_m_arr[BLOCK_M];
-    for (int i = 0; i < m_len; ++i) {
-        int m_idx = m_start + i;
-        const float* dAptr = dA_base + m_idx * stride_dA_csize;
-        acc_t dA_val = (acc_t)__ldg(dAptr);
-        dA_m_arr[i] = dA_val;
-        acc_t scale = 0;
-        if (!HAS_SEQ_IDX) {
-            scale = (acc_t)expf((float)dA_val);
-        } else {
-            int seq_pos = seq_start + m_idx;
-            int64_t seq_m = (seq_pos >= 0 && seq_pos < seqlen) ? seq_idx_base[seq_pos] : (int64_t)-1;
-            scale = (seq_m == seq_idx_prev) ? (acc_t)expf((float)dA_val) : (acc_t)0;
-        }
-        scale_m_arr[i] = scale;
-    }
-
-    // compute contribution from C @ prev_states, then apply scale_m per row
-    for (int kd = 0; kd < dstate; kd += BLOCK_D) {
-        int kd_len = min(BLOCK_D, dstate - kd);
-
-        extern __shared__ char smem_arr[]; 
-       
-        acc_t C_tile_reg[BLOCK_M][BLOCK_D]; 
-
+    if (n_idx0 < n_limit) {
         for (int i = 0; i < m_len; ++i) {
             int m_idx = m_start + i;
-            scalar_t* C_row = (scalar_t*) (C_base + m_idx * stride_C_seqlen + kd * stride_C_dstate);
-            for (int kk = 0; kk < kd_len; ++kk) {
-                scalar_t v = __ldg(C_row + kk * stride_C_dstate); // read-only cache
-                C_tile_reg[i][kk] = (acc_t)v;
+            const float* dAptr = dA_base + m_idx * stride_dA_csize;
+            acc_t dA_val = (acc_t)__ldg(dAptr);
+            dA_m_arr[i] = dA_val;
+            acc_t scale = 0;
+            if (!HAS_SEQ_IDX) {
+                scale = (acc_t)expf((float)dA_val);
+            } else {
+                int seq_pos = seq_start + m_idx;
+                int64_t seq_m = (seq_pos >= 0 && seq_pos < seqlen) ? seq_idx_base[seq_pos] : (int64_t)-1;
+                scale = (seq_m == seq_idx_prev) ? (acc_t)expf((float)dA_val) : (acc_t)0;
+            }
+            scale_m_arr[i] = scale;
+        }
+    }
+
+    // Allocate shared memory (C, states)
+    // C: [BLOCK_M][BLOCK_D + 8] with padding for bank conflicts
+    // prev_states: [BLOCK_D][BLOCK_N + 8] 
+    // Accumulator Exchange: [BLOCK_M][BLOCK_N + 8]
+    extern __shared__ __half smem_pool[];
+    __half* smem_C = smem_pool; 
+    __half* smem_States = smem_pool + BLOCK_M * (BLOCK_D + 8);
+    float* smem_Accum = reinterpret_cast<float*>(smem_pool);
+
+    // WMMA Fragments
+    wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, __half, wmma::row_major> a_frag;
+    wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, __half, wmma::row_major> b_frag;
+    
+    int tid = threadIdx.x;
+    int warpId = tid / 32;
+
+    wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> acc_frags[4];
+    #pragma unroll
+    for(int i=0; i<4; ++i) wmma::fill_fragment(acc_frags[i], 0.0f);
+
+    for (int kd = 0; kd < dstate; kd += BLOCK_D) {
+        // Load C from global memory
+        for (int i = tid; i < BLOCK_M * BLOCK_D; i += blockDim.x) {
+            int r = i / BLOCK_D;
+            int c = i % BLOCK_D;
+            int smem_idx = r * (BLOCK_D + 8) + c;
+            if (m_start + r < chunk_size_limit && kd + c < dstate) {
+                const scalar_t* src = C_base + (m_start + r) * stride_C_seqlen + (kd + c) * stride_C_dstate;
+                __half val = (__half)(*src); 
+                smem_C[smem_idx] = val; 
+            } else {
+                smem_C[smem_idx] = 0;
             }
         }
 
-        // Load prev_states tile for this thread's columns
-        acc_t P_tile_col0[BLOCK_D];
-        acc_t P_tile_col1[BLOCK_D];
-        for (int kk = 0; kk < kd_len; ++kk) {
-            int k_idx = kd + kk;
-            const scalar_t* pptr0 = states_base + n_idx0 * stride_states_hdim + k_idx * stride_states_dstate;
-            scalar_t pv0 = __ldg(pptr0);
-            P_tile_col0[kk] = (acc_t)pv0;
-            if (has_col1) {
-                const scalar_t* pptr1 = states_base + n_idx1 * stride_states_hdim + k_idx * stride_states_dstate;
-                scalar_t pv1 = __ldg(pptr1);
-                P_tile_col1[kk] = (acc_t)pv1;
+        // Load states
+        for (int i = tid; i < BLOCK_D * BLOCK_N; i += blockDim.x) {
+            int r = i / BLOCK_N;
+            int c = i % BLOCK_N;
+            int smem_idx = r * (BLOCK_N + 8) + c;
+                
+            int global_k = kd + r;
+            int global_n = n_start + c;
+                
+            if (global_k < dstate && global_n < headdim) {
+                const scalar_t* src = states_base + c * stride_states_hdim + global_k * stride_states_dstate;
+                 __half val = (__half)(*src);
+                smem_States[smem_idx] = val;
+            } else {
+                smem_States[smem_idx] = 0;
             }
         }
+            
+        __syncthreads(); 
 
-        // Multiply: acc += C_tile_reg * P_tile for each column
-        for (int i = 0; i < m_len; ++i) {
-            acc_t sum0 = acc_col0[i];
-            for (int kk = 0; kk < kd_len; ++kk) {
-                sum0 += C_tile_reg[i][kk] * P_tile_col0[kk];
-            }
-            acc_col0[i] = sum0;
-            if (has_col1) {
-                acc_t sum1 = acc_col1[i];
-                for (int kk = 0; kk < kd_len; ++kk) {
-                    sum1 += C_tile_reg[i][kk] * P_tile_col1[kk];
+        int num_warps = blockDim.x / 32;
+        // Loop over M steps if the block handles multiple WMMA vertical tiles per warp, or if warps need to loop
+        for (int w_m = warpId * 16; w_m < BLOCK_M; w_m += num_warps * 16) {
+            
+            for (int k_step = 0; k_step < BLOCK_D; k_step += WMMA_K) {
+                int a_off = w_m * (BLOCK_D + 8) + k_step;
+                wmma::load_matrix_sync(a_frag, smem_C + a_off, BLOCK_D + 8);
+
+                #pragma unroll
+                for(int ni=0; ni<4; ++ni) {
+                    int n_step = ni * 16;
+                    int b_off = k_step * (BLOCK_N + 8) + n_step;
+                    wmma::load_matrix_sync(b_frag, smem_States + b_off, BLOCK_N + 8);
+                    wmma::mma_sync(acc_frags[ni], a_frag, b_frag, acc_frags[ni]);
                 }
-                acc_col1[i] = sum1;
+            }
+        }
+        __syncthreads();
+    }
+
+    // Store WMMA results to Shared Memory
+    int num_warps = blockDim.x / 32;
+    for (int w_m = warpId * 16; w_m < BLOCK_M; w_m += num_warps * 16) {
+        #pragma unroll
+        for(int ni=0; ni<4; ++ni) {
+            int n_step = ni * 16;
+            float* dest = smem_Accum + w_m * (BLOCK_N + 8) + n_step;
+            wmma::store_matrix_sync(dest, acc_frags[ni], BLOCK_N + 8, wmma::mem_row_major);
+        }
+    }
+    
+    __syncthreads();
+
+    if (n_idx0 < n_limit) {
+        for(int i=0; i<m_len; ++i) {
+            int r = i;
+            acc_col0[i] += smem_Accum[r * (BLOCK_N + 8) + n_idx0]; // Read from WMMA output
+            if (has_col1) {
+                acc_col1[i] += smem_Accum[r * (BLOCK_N + 8) + n_idx1];
             }
         }
     }
 
     // Apply scale from dA_cumsum per m to C @ prev_states term
-    for (int i = 0; i < m_len; ++i) {
-        acc_t s = scale_m_arr[i];
-        acc_col0[i] *= s;
-        if (has_col1) acc_col1[i] *= s;
+    if (n_idx0 < n_limit) {
+        for (int i = 0; i < m_len; ++i) {
+            acc_t s = scale_m_arr[i];
+            acc_col0[i] *= s;
+            if (has_col1) acc_col1[i] *= s;
+        }
     }
 
     // accumlate cb * x over k across chunk dimensions, including dA_cumsum factors and causal masking
     int K_MAX = IS_CAUSAL ? min((pid_m + 1) * BLOCK_M, chunk_size_limit) : chunk_size_limit;
-    for (int k0 = 0; k0 < K_MAX; k0 += BLOCK_K) {
-        int klen = min(BLOCK_K, K_MAX - k0);
+    
+    if (n_idx0 < n_limit) { 
+        for (int k0 = 0; k0 < K_MAX; k0 += BLOCK_K) {
+            int klen = min(BLOCK_K, K_MAX - k0);
+            
+            // preload dt_k and dA_k
+            acc_t dt_vec[BLOCK_K];
+            acc_t dA_k_vec[BLOCK_K];
+            acc_t x_tile_col0[BLOCK_K];
+            acc_t x_tile_col1[BLOCK_K];
 
-        // load cb_tile into shared memory or registers
-        acc_t cb_tile_reg[BLOCK_M][BLOCK_K];
-        acc_t x_tile_col0[BLOCK_K];
-        acc_t x_tile_col1[BLOCK_K];
-
-        // preload dt_k and dA_k
-        acc_t dt_vec[BLOCK_K];
-        acc_t dA_k_vec[BLOCK_K];
-        for (int kk = 0; kk < klen; ++kk) {
-            int k_idx = k0 + kk;
-            const scalar_t* dtptr = dt_base + k_idx * stride_dt_csize;
-            dt_vec[kk] = (acc_t)__ldg(dtptr);
-            const float* dAkptr = dA_base + k_idx * stride_dA_csize;
-            dA_k_vec[kk] = (acc_t)__ldg(dAkptr);
-        }
-
-        for (int i = 0; i < m_len; ++i) {
-            int m_idx = m_start + i;
             for (int kk = 0; kk < klen; ++kk) {
                 int k_idx = k0 + kk;
-                // compute mask for causal: require m_idx >= k_idx (within chunk offset) if IS_CAUSAL
-                bool pass = (!IS_CAUSAL) || (m_idx >= k_idx); 
-                if (!pass) { cb_tile_reg[i][kk] = (acc_t)0; continue; }
-                const scalar_t* cbptr = cb_base + m_idx * stride_cb_m + k_idx * stride_cb_k;
-                scalar_t v = __ldg(cbptr);
-                // multiply by exp(min(dA_m - dA_k, 0)) and dt scalar
+                const scalar_t* dtptr = dt_base + k_idx * stride_dt_csize;
+                dt_vec[kk] = (acc_t)__ldg(dtptr);
+                const float* dAkptr = dA_base + k_idx * stride_dA_csize;
+                dA_k_vec[kk] = (acc_t)__ldg(dAkptr);
+                const scalar_t* base_ptr = x_base + k_idx * stride_x_seqlen + n_idx0 * stride_x_hdim;
+                acc_t val0;
+                if (USE_VEC2 && has_col1 && stride_x_hdim == 1) {
+                    const float2* xptr2 = reinterpret_cast<const float2*>(base_ptr);
+                    float2 xv = __ldg(xptr2);
+                    val0 = (acc_t)xv.x;
+                    x_tile_col0[kk] = val0;
+                    x_tile_col1[kk] = (acc_t)xv.y;
+                } else {
+                    val0 = (acc_t)__ldg(base_ptr);
+                    x_tile_col0[kk] = val0;
+                    if (has_col1) {
+                         const scalar_t* base_ptr1 = x_base + k_idx * stride_x_seqlen + n_idx1 * stride_x_hdim;
+                         x_tile_col1[kk] = (acc_t)__ldg(base_ptr1);
+                    }
+                }
+            }
+
+            // acc += cb_tile_reg * x_tile for each column
+            for (int i = 0; i < m_len; ++i) {
+                int m_idx = m_start + i;
                 float dA_m = (float)dA_m_arr[i];
-                float dA_k = (float)dA_k_vec[kk];
-                float diff = dA_m - dA_k;
-                if (diff > 0.0f) diff = 0.0f;
-                float scale = expf(diff);
-                cb_tile_reg[i][kk] = (acc_t)v * dt_vec[kk] * (acc_t)scale;
-            }
-        }
+                
+                acc_t sum0 = 0;
+                acc_t sum1 = 0;
 
-        // Load x tile for this thread's columns
-        for (int kk = 0; kk < klen; ++kk) {
-            int k_idx = k0 + kk;
-            const scalar_t* base_ptr = x_base + k_idx * stride_x_seqlen + n_idx0 * stride_x_hdim;
-            acc_t val0;
-            if (USE_VEC2 && has_col1 && stride_x_hdim == 1) {
-                const float2* xptr2 = reinterpret_cast<const float2*>(base_ptr);
-                float2 xv = __ldg(xptr2);
-                val0 = (acc_t)xv.x;
-                x_tile_col0[kk] = val0;
-                x_tile_col1[kk] = (acc_t)xv.y;
-                continue;
-            } else {
-                val0 = (acc_t)__ldg(base_ptr);
-                x_tile_col0[kk] = val0;
-                if (has_col1) {
-                    const scalar_t* base_ptr1 = x_base + k_idx * stride_x_seqlen + n_idx1 * stride_x_hdim;
-                    x_tile_col1[kk] = (acc_t)__ldg(base_ptr1);
-                }
-            }
-        }
-
-        // acc += cb_tile_reg * x_tile for each column
-        for (int i = 0; i < m_len; ++i) {
-            acc_t sum0 = acc_col0[i];
-            for (int kk = 0; kk < klen; ++kk) {
-                sum0 += cb_tile_reg[i][kk] * x_tile_col0[kk];
-            }
-            acc_col0[i] = sum0;
-            if (has_col1) {
-                acc_t sum1 = acc_col1[i];
                 for (int kk = 0; kk < klen; ++kk) {
-                    sum1 += cb_tile_reg[i][kk] * x_tile_col1[kk];
+                    int k_idx = k0 + kk;
+                    
+                    // Mask logic
+                    bool pass = (!IS_CAUSAL) || (m_idx >= k_idx); 
+                    if (!pass) continue; 
+
+                    const scalar_t* cbptr = cb_base + m_idx * stride_cb_m + k_idx * stride_cb_k;
+                    scalar_t v = __ldg(cbptr);
+                    
+                    float diff = dA_m - (float)dA_k_vec[kk];
+                    if (diff > 0.0f) diff = 0.0f;
+                    float scale = expf(diff);
+                    
+                    acc_t cb_val = (acc_t)v * dt_vec[kk] * (acc_t)scale;
+
+                    sum0 += cb_val * x_tile_col0[kk];
+                    if (has_col1) {
+                        sum1 += cb_val * x_tile_col1[kk];
+                    }
                 }
-                acc_col1[i] = sum1;
+                acc_col0[i] += sum0;
+                if (has_col1) acc_col1[i] += sum1;
             }
         }
     }
+
+    if (n_idx0 >= n_limit) return; 
 
     // HAS_D from Triton kernel
     if (HAS_D) {
