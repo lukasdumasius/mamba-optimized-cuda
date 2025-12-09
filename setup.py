@@ -26,8 +26,8 @@ from torch.utils.cpp_extension import (
 )
 
 # Limit parallel CUDA compilations to prevent RAM exhaustion during build.
-if "MAX_JOBS" not in os.environ:
-    os.environ["MAX_JOBS"] = "4"
+# if "MAX_JOBS" not in os.environ:
+#     os.environ["MAX_JOBS"] = "4"
 
 with open("README.md", "r", encoding="utf-8") as fh:
     long_description = fh.read()
@@ -72,6 +72,22 @@ def get_cuda_bare_metal_version(cuda_dir):
     bare_metal_ver = parse(output[release_idx].split(",")[0])
 
     return raw_output, bare_metal_ver
+
+
+def get_gpu_compute_capability():
+    try:
+        import torch
+        if not torch.cuda.is_available():
+            return None
+        
+        device = torch.cuda.current_device()
+        prop = torch.cuda.get_device_properties(device)
+        major = prop.major
+        minor = prop.minor
+        return (major, minor)
+    except Exception as e:
+        print(f"Warning: Could not detect GPU compute capability: {e}")
+        return None
 
 
 def get_hip_version(rocm_dir):
@@ -175,41 +191,62 @@ if not SKIP_CUDA_BUILD:
                     f"{PACKAGE_NAME} is only supported on CUDA 11.6 and above.  "
                     "Note: make sure nvcc has a supported version by running nvcc -V."
                 )
+        else:
+            bare_metal_version = Version("12.0")
 
-        if bare_metal_version <= Version("12.9"):
+        gpu_cc = get_gpu_compute_capability()
+        if gpu_cc:
+            major, minor = gpu_cc
+            cc_flag = []  # Reset to only include detected GPU
             cc_flag.append("-gencode")
-            cc_flag.append("arch=compute_53,code=sm_53")
-            cc_flag.append("-gencode")
-            cc_flag.append("arch=compute_62,code=sm_62")
-            cc_flag.append("-gencode")
-            cc_flag.append("arch=compute_70,code=sm_70")
-            cc_flag.append("-gencode")
-            cc_flag.append("arch=compute_72,code=sm_72")
-        cc_flag.append("-gencode")
-        cc_flag.append("arch=compute_75,code=sm_75")
-        cc_flag.append("-gencode")
-        cc_flag.append("arch=compute_80,code=sm_80")
-        cc_flag.append("-gencode")
-        cc_flag.append("arch=compute_87,code=sm_87")
-        if bare_metal_version >= Version("11.8"):
-            cc_flag.append("-gencode")
-            cc_flag.append("arch=compute_90,code=sm_90")
-        if bare_metal_version >= Version("12.8"):
-            cc_flag.append("-gencode")
-            cc_flag.append("arch=compute_100,code=sm_100")
-            cc_flag.append("-gencode")
-            cc_flag.append("arch=compute_120,code=sm_120")
-        if bare_metal_version >= Version("13.0"):
-            cc_flag.append("-gencode")
-            cc_flag.append("arch=compute_103,code=sm_103")
-            cc_flag.append("-gencode")
-            cc_flag.append("arch=compute_110,code=sm_110")
-            cc_flag.append("-gencode")
-            cc_flag.append("arch=compute_121,code=sm_121")
-
-
-    # HACK: The compiler flag -D_GLIBCXX_USE_CXX11_ABI is set to be the same as
-    # torch._C._GLIBCXX_USE_CXX11_ABI
+            cc_flag.append(f"arch=compute_{major}{minor},code=sm_{major}{minor}")
+            print(f"\n✓ Auto-detected GPU compute capability: {major}.{minor}")
+            print(f"✓ Compiling ONLY for sm_{major}{minor} (this will speed up compilation significantly)\n")
+        else:
+            # Fallback: Allow override via environment variable
+            target_arch = os.getenv("TORCH_CUDA_ARCH_LIST")
+            if target_arch:
+                # Parse format like "7.5;8.0" or "8.0"
+                archs = target_arch.replace(";", " ").split()
+                cc_flag = []
+                for arch in archs:
+                    major, minor = map(int, arch.split("."))
+                    cc_flag.append("-gencode")
+                    cc_flag.append(f"arch=compute_{major}{minor},code=sm_{major}{minor}")
+                print(f"Using custom architecture flags: {target_arch}")
+            else:
+                # Fallback to all architectures if detection fails
+                print("Warning: Could not detect GPU. Compiling for all architectures.")
+                if bare_metal_version <= Version("12.9"):
+                    cc_flag.append("-gencode")
+                    cc_flag.append("arch=compute_53,code=sm_53")
+                    cc_flag.append("-gencode")
+                    cc_flag.append("arch=compute_62,code=sm_62")
+                    cc_flag.append("-gencode")
+                    cc_flag.append("arch=compute_70,code=sm_70")
+                    cc_flag.append("-gencode")
+                    cc_flag.append("arch=compute_72,code=sm_72")
+                cc_flag.append("-gencode")
+                cc_flag.append("arch=compute_75,code=sm_75")
+                cc_flag.append("-gencode")
+                cc_flag.append("arch=compute_80,code=sm_80")
+                cc_flag.append("-gencode")
+                cc_flag.append("arch=compute_87,code=sm_87")
+                if bare_metal_version >= Version("11.8"):
+                    cc_flag.append("-gencode")
+                    cc_flag.append("arch=compute_90,code=sm_90")
+                if bare_metal_version >= Version("12.8"):
+                    cc_flag.append("-gencode")
+                    cc_flag.append("arch=compute_100,code=sm_100")
+                    cc_flag.append("-gencode")
+                    cc_flag.append("arch=compute_120,code=sm_120")
+                if bare_metal_version >= Version("13.0"):
+                    cc_flag.append("-gencode")
+                    cc_flag.append("arch=compute_103,code=sm_103")
+                    cc_flag.append("-gencode")
+                    cc_flag.append("arch=compute_110,code=sm_110")
+                    cc_flag.append("-gencode")
+                    cc_flag.append("arch=compute_121,code=sm_121")
     # https://github.com/pytorch/pytorch/blob/8472c24e3b5b60150096486616d98b7bea01500b/torch/utils/cpp_extension.py#L920
     if FORCE_CXX11_ABI:
         torch._C._GLIBCXX_USE_CXX11_ABI = True

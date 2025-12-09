@@ -2,12 +2,35 @@
 import torch
 import sys
 import json
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 # Toggle which test harness to run
 USE_ENHANCED_TEST = True
+
+
+def benchmark_kernel(func, *args, warmup=10, repeat=100):
+    """Benchmark a kernel function with warmup and multiple runs."""
+    # Warmup
+    for _ in range(warmup):
+        _ = func(*args)
+    
+    # Synchronize before timing
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    
+    # Time multiple runs
+    start = time.perf_counter()
+    for _ in range(repeat):
+        _ = func(*args)
+    
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    end = time.perf_counter()
+    
+    return (end - start) / repeat * 1000  # Return average time in milliseconds
 
 
 def test_chunk_scan():
@@ -23,7 +46,7 @@ def test_chunk_scan():
         (1, 256, 8, 64, 1, 32, 64),
         (2, 256, 8, 64, 2, 32, 128),
     ]
-    dtypes = [torch.float32, torch.float16]
+    dtypes = [torch.float16]  # Only FP16 - CUDA kernel is WMMA-only
 
     passed = 0
     total = 0
@@ -86,7 +109,15 @@ def test_chunk_scan():
 
                     import mamba_ssm.ops.triton.ssd_chunk_scan as ssd_module
                     importlib.reload(ssd_module)
+                    
+                    # Correctness check
                     out_triton, out_x_triton = ssd_module._chunk_scan_fwd(
+                        cb_ref, x_ref, dt_ref, dA_cumsum_ref, C_ref, states_ref, D_t, z_t, seq_t
+                    )
+                    
+                    # Benchmark Triton
+                    triton_time = benchmark_kernel(
+                        ssd_module._chunk_scan_fwd,
                         cb_ref, x_ref, dt_ref, dA_cumsum_ref, C_ref, states_ref, D_t, z_t, seq_t
                     )
 
@@ -98,12 +129,20 @@ def test_chunk_scan():
                     mamba_ssm.ops.kernel_config._config_cache = None
                     importlib.reload(mamba_ssm.ops.kernel_config)
                     importlib.reload(ssd_module)
+                    
+                    # Correctness check
                     out_cuda, out_x_cuda = ssd_module._chunk_scan_fwd(
                         cb, x, dt, dA_cumsum, C, states, D_t, z_t, seq_t
                     )
+                    
+                    # Benchmark CUDA
+                    cuda_time = benchmark_kernel(
+                        ssd_module._chunk_scan_fwd,
+                        cb, x, dt, dA_cumsum, C, states, D_t, z_t, seq_t
+                    )
 
-                    rtol = 1e-2 if dtype == torch.float16 else 1e-4
-                    atol = 1e-2 if dtype == torch.float16 else 1e-5
+                    rtol = 1e-2  # FP16 tolerance
+                    atol = 1e-2  # FP16 tolerance
 
                     out_match = torch.allclose(out_triton, out_cuda, rtol=rtol, atol=atol)
                     out_x_match = (out_x_triton is None and out_x_cuda is None) or \
@@ -111,12 +150,18 @@ def test_chunk_scan():
                                    torch.allclose(out_x_triton, out_x_cuda, rtol=rtol, atol=atol))
 
                     case_desc = f"D={use_D}, z={use_z}, seq_idx={use_seq_idx}"
+                    speedup = triton_time / cuda_time if cuda_time > 0 else 0.0
+                    
+                    latency_info = f"  Triton: {triton_time:.3f}ms, CUDA: {cuda_time:.3f}ms, Speedup: {speedup:.2f}x"
+                    
                     if out_match and out_x_match:
                         passed += 1
                         print(f"✓ batch={batch}, seqlen={seqlen}, nheads={nheads}, hdim={hdim}, dtype={dtype}, {case_desc}")
+                        print(latency_info)
                     else:
                         max_diff = (out_triton - out_cuda).abs().max().item()
                         print(f"✗ batch={batch}, seqlen={seqlen}, nheads={nheads}, hdim={hdim}, dtype={dtype}, {case_desc}, max_diff={max_diff:.6e}")
+                        print(latency_info)
 
                 # Run a small set of representative flag combinations
                 run_case(use_D=True, use_z=True, use_seq_idx=True)
@@ -142,7 +187,7 @@ def test_chunk_scan_original():
         (1, 256, 8, 64, 1, 32, 64),
         (2, 256, 8, 64, 2, 32, 128),
     ]
-    dtypes = [torch.float32, torch.float16]
+    dtypes = [torch.float16]  # Only FP16 - CUDA kernel is WMMA-only
 
     passed = 0
     total = 0
@@ -202,8 +247,8 @@ def test_chunk_scan_original():
                     cb, x, dt, dA_cumsum, C, states, D, z, None
                 )
 
-                rtol = 1e-2 if dtype == torch.float16 else 1e-4
-                atol = 1e-2 if dtype == torch.float16 else 1e-5
+                rtol = 1e-2  # FP16 tolerance
+                atol = 1e-2  # FP16 tolerance
 
                 out_match = torch.allclose(out_triton, out_cuda, rtol=rtol, atol=atol)
                 out_x_match = out_x_triton is None and out_x_cuda is None or \
