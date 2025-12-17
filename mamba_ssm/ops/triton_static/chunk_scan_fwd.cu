@@ -372,7 +372,6 @@ __global__ void chunk_scan_fwd_kernel(
             __syncthreads();
 
             acc_t dt_vec[BLOCK_K];
-            acc_t dA_k_vec[BLOCK_K];
             float expf_neg_dA_k[BLOCK_K];
             acc_t x_tile_col0[BLOCK_K];
             acc_t x_tile_col1[BLOCK_K];
@@ -384,7 +383,6 @@ __global__ void chunk_scan_fwd_kernel(
 
                 const float* dAkptr = dA_base + k_idx * stride_dA_csize;
                 float dAk_f = __ldg(dAkptr);
-                dA_k_vec[kk] = (acc_t)dAk_f;
                 expf_neg_dA_k[kk] = expf(-dAk_f);
 
                 const scalar_t* base_ptr0 = x_base
@@ -419,8 +417,7 @@ __global__ void chunk_scan_fwd_kernel(
             }
 
             for (int i = 0; i < m_len; ++i) {
-                int m_idx   = m_start + i;
-                float dA_mf = (float)dA_m_arr[i];
+                int m_idx = m_start + i;
 
                 acc_t sum0 = 0;
                 acc_t sum1 = 0;
@@ -432,13 +429,7 @@ __global__ void chunk_scan_fwd_kernel(
                     __half v_half = smem_cb[i * (BLOCK_K + 8) + kk];
                     scalar_t v    = (scalar_t)v_half;
 
-                    float dAk_f = (float)dA_k_vec[kk];
-                    float scale;
-                    if (dA_mf <= dAk_f) {
-                        scale = expf_dA_m[i] * expf_neg_dA_k[kk];
-                    } else {
-                        scale = 1.0f;
-                    }
+                    float scale = fminf(expf_dA_m[i] * expf_neg_dA_k[kk], 1.0f);
 
                     acc_t cb_val = (acc_t)v * dt_vec[kk] * (acc_t)scale;
 
