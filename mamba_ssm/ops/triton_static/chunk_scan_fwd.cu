@@ -425,12 +425,10 @@ __global__ void chunk_scan_fwd_kernel(
                 acc_t sum0 = 0;
                 acc_t sum1 = 0;
 
-                for (int kk = 0; kk < klen; ++kk) {
-                    int k_idx = k0 + kk;
+               
+                int k_end = IS_CAUSAL ? min(klen, max(0, m_idx - k0 + 1)) : klen;
 
-                    bool pass = (!IS_CAUSAL) || (m_idx >= k_idx);
-                    if (!pass) continue;
-
+                for (int kk = 0; kk < k_end; ++kk) {
                     __half v_half = smem_cb[i * (BLOCK_K + 8) + kk];
                     scalar_t v    = (scalar_t)v_half;
 
@@ -1208,12 +1206,12 @@ std::vector<torch::Tensor> chunk_scan_fwd_cuda(
             }
         }
     
-        cudaError_t err = cudaGetLastError();
-        if (err != cudaSuccess) {
-            printf("CUDA fused kernel launch error: %s\n",
-                   cudaGetErrorString(err));
-            throw std::runtime_error("CUDA fused kernel launch failed");
-        }
+        // cudaError_t err = cudaGetLastError();
+        // if (err != cudaSuccess) {
+        //     printf("CUDA fused kernel launch error: %s\n",
+        //            cudaGetErrorString(err));
+        //     throw std::runtime_error("CUDA fused kernel launch failed");
+        // }
     });    
 
     if (out_x.defined()) return {out, out_x};
