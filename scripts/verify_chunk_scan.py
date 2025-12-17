@@ -11,26 +11,29 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 USE_ENHANCED_TEST = True
 
 
-def benchmark_kernel(func, *args, warmup=10, repeat=100):
-    """Benchmark a kernel function with warmup and multiple runs."""
-    # Warmup
+def benchmark_kernel(func, *args, warmup=50, repeat=200):
+    """Benchmark a kernel function with warmup and multiple runs using CUDA events."""
+    # Warmup (more iterations for stable GPU state)
     for _ in range(warmup):
         _ = func(*args)
     
-    # Synchronize before timing
-    if torch.cuda.is_available():
-        torch.cuda.synchronize()
+    torch.cuda.synchronize()
     
-    # Time multiple runs
-    start = time.perf_counter()
+    # Use CUDA events for accurate GPU timing
+    start_event = torch.cuda.Event(enable_timing=True)
+    end_event = torch.cuda.Event(enable_timing=True)
+    
+    times = []
     for _ in range(repeat):
+        start_event.record()
         _ = func(*args)
-    
-    if torch.cuda.is_available():
+        end_event.record()
         torch.cuda.synchronize()
-    end = time.perf_counter()
+        times.append(start_event.elapsed_time(end_event))
     
-    return (end - start) / repeat * 1000  # Return average time in milliseconds
+    # Return median to reduce outlier impact
+    times.sort()
+    return times[len(times) // 2]  # Median time in milliseconds
 
 
 def test_chunk_scan():

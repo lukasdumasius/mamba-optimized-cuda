@@ -315,17 +315,36 @@ if not SKIP_CUDA_BUILD:
         
         if any(k.get("use_cuda", False) for k in kernels_config.values()):
             cuda_sources = ["mamba_ssm/ops/triton_static/bindings.cpp"]
+            chunk_scan_extra_args = dict(extra_compile_args)
+            chunk_scan_extra_args["nvcc"] = list(extra_compile_args["nvcc"])
+            
             if kernels_config.get("swiglu", {}).get("use_cuda", False):
                 cuda_sources.append("mamba_ssm/ops/triton_static/swiglu.cu")
             if kernels_config.get("ssd_chunk_scan", {}).get("use_cuda", False):
-                cuda_sources.append("mamba_ssm/ops/triton_static/chunk_scan_fwd.cu")
+                opt_level = kernels_config.get("ssd_chunk_scan", {}).get("opt_level", 6)
+                opt_files = {
+                    0: "mamba_ssm/ops/triton_static/chunk_scan_fwd.cu",  # Direct main file
+                    1: "optimization_steps/01_baseline.cu",
+                    2: "optimization_steps/02_wmma_tensor_cores.cu",
+                    3: "optimization_steps/03_precompute_exp.cu",
+                    4: "optimization_steps/04_shared_memory_cb.cu",
+                    5: "optimization_steps/05_compile_time_templates.cu",
+                    6: "optimization_steps/06_branchless_fminf.cu",
+                    7: "optimization_steps/07_adaptive_branchless.cu",
+                }
+                cuda_source = opt_files.get(opt_level, "mamba_ssm/ops/triton_static/chunk_scan_fwd.cu")
+                cuda_sources.append(cuda_source)
+                print(f"\n✓ Building chunk_scan_fwd with optimization level {opt_level}: {cuda_source}\n")
             
             ext_modules.append(
                 CUDAExtension(
                     name="mamba_ssm.ops.triton_static.cuda_kernels",
                     sources=cuda_sources,
-                    extra_compile_args=extra_compile_args,
-                    include_dirs=[Path(this_dir) / "mamba_ssm" / "ops" / "triton_static"],
+                    extra_compile_args=chunk_scan_extra_args,
+                    include_dirs=[
+                        Path(this_dir) / "mamba_ssm" / "ops" / "triton_static",
+                        Path(this_dir) / "optimization_steps",
+                    ],
                 )
             )
 

@@ -13,7 +13,8 @@
   },
   "ssd_chunk_scan": {
     "use_cuda": true,
-    "description": "Chunk scan kernel for SSD"
+    "opt_level": 0,
+    "description": "Chunk scan kernel for SSD (opt_level: 0=main, 1=baseline, 2=wmma, 3=precompute_exp, 4=smem_cb, 5=templates, 6=branchless, 7=adaptive)"
   },
   "ssd_chunk_state": {
     "use_cuda": false,
@@ -28,7 +29,7 @@
     "description": "State passing between chunks in SSD"
   },
   "swiglu": {
-    "use_cuda": true,
+    "use_cuda": false,
     "description": "SwiGLU activation function"
   }
 }
